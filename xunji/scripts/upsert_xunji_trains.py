@@ -119,7 +119,7 @@ def load_action_library(cache_dir: Path) -> dict:
 
 def reader_script_path() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "xunji-reader" / "scripts" / "fetch_xunji_trains.py"
+    return repo_root / "xunji" / "scripts" / "fetch_xunji_trains.py"
 
 
 def latest_cached_train_date(cache_dir: Path) -> str | None:
@@ -368,6 +368,7 @@ def build_training_line(parsed: dict) -> str:
     segments.append(parsed["title"])
     if parsed.get("train_time"):
         segments.append(parsed["train_time"])
+    segments.extend(parsed.get("notes", []))
     for action in renumber_actions(parsed.get("actions", [])):
         segments.extend(action)
     return ",".join(segments)
@@ -498,17 +499,23 @@ def normalize_action_tokens(
             warnings.append(
                 f"Discarded non-exact range token '{token}' instead of structured slots"
             )
+            if preserve_invalid_in_remarks:
+                note_tokens.append(token)
             continue
 
         if token.upper() in EXPLANATORY_TOKENS or token in EXPLANATORY_TOKENS:
             warnings.append(
                 f"Discarded explanatory token '{token}' instead of structured slots"
             )
+            if preserve_invalid_in_remarks:
+                note_tokens.append(token)
             continue
 
         warnings.append(
             f"Discarded non-structured token '{token}' instead of structured slots"
         )
+        if preserve_invalid_in_remarks:
+            note_tokens.append(token)
 
     return normalized_action, note_tokens, warnings
 
@@ -713,6 +720,41 @@ def validate_train_time_preservation(
             )
 
 
+def is_valid_strength_set_value(token: str) -> bool:
+    normalized = token.strip()
+    return bool(
+        VALID_WEIGHT_RE.fullmatch(normalized)
+        or REPS_TOKEN_RE.fullmatch(normalized)
+        or TIME_TOKEN_RE.fullmatch(normalized)
+    )
+
+
+def validate_strength_set_values(res_lines: list[str]) -> None:
+    for line in res_lines:
+        parsed = parse_training_line(line)
+        if parsed.get("rest_day"):
+            continue
+        for action in parsed.get("actions", []):
+            set_indices = [
+                index
+                for index, token in enumerate(action)
+                if extract_set_count(token) is not None
+            ]
+            if not set_indices:
+                continue
+            for position, set_index in enumerate(set_indices):
+                next_set_index = (
+                    set_indices[position + 1]
+                    if position + 1 < len(set_indices)
+                    else len(action)
+                )
+                payload = action[set_index + 1 : next_set_index]
+                if not any(is_valid_strength_set_value(token) for token in payload):
+                    raise RuntimeError(
+                        f"Set token '{action[set_index]}' in action '{action[0]}' must include at least one of weight, reps, or time."
+                    )
+
+
 def build_cache_payload(
     date_str: str, res: list[str], count: int | None = None, **extra: object
 ) -> dict:
@@ -728,14 +770,13 @@ def build_cache_payload(
 
 def fetch_remote(res_lines: list[str], api_key: str) -> dict:
     url = f"{BASE_URL}{API_PATH}"
-    request_body = json.dumps({"res": res_lines, "apikey": api_key}).encode("utf-8")
+    request_body = json.dumps({"res": res_lines}).encode("utf-8")
     request = Request(
         url,
         data=request_body,
         method="POST",
         headers={
             "Authorization": f"Bearer {api_key}",
-            "x-api-key": api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
@@ -781,21 +822,18 @@ def fetch_remote(res_lines: list[str], api_key: str) -> dict:
             "acknowledged_with_empty_res": True,
         }
 
-    if not isinstance(count, int):
-        raise RuntimeError(
-            f"API response did not contain an integer 'count': {decoded_text}"
-        )
-    if count <= 0:
+    if isinstance(count, int) and count <= 0:
         raise RuntimeError(
             f"API response 'count' must be > 0 after successful write: {decoded_text}"
         )
 
     return {
-        "count": count,
+        "count": count if isinstance(count, int) else len(res),
         "res": res,
         "response_res_empty": payload.get("response_res_empty"),
         "raw_response": decoded_text,
         "acknowledged_with_empty_res": False,
+        "server_count": count if isinstance(count, int) else None,
     }
 
 
@@ -882,6 +920,7 @@ def main() -> int:
         validate_train_time_preservation(
             cache_path, res_lines, args.allow_train_time_drop
         )
+        validate_strength_set_values(res_lines)
 
         if args.dry_run:
             emit(
@@ -902,10 +941,11 @@ def main() -> int:
         api_key = resolve_api_key()
         remote_payload = fetch_remote(res_lines, api_key)
         final_res = validate_res_lines(target_date, remote_payload["res"])
-        if remote_payload["count"] != len(final_res):
+        server_count = remote_payload.get("server_count")
+        if isinstance(server_count, int) and server_count != len(final_res):
             raise RuntimeError(
                 "API response count does not match the number of returned res lines: "
-                f"count={remote_payload['count']} len(res)={len(final_res)}; "
+                f"count={server_count} len(res)={len(final_res)}; "
                 f"raw_response={remote_payload['raw_response']}"
             )
         payload = build_cache_payload(

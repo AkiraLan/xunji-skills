@@ -1,6 +1,6 @@
-# 训记.skills
+# 训记 skill
 
-一个小而专注的 训记.skills 仓库：
+一个小而专注的 训记 skill 仓库：
 它能帮 Agent **读取训练**、**写入训练**、**串联训练工作流**，但不会直接替代训记 App 内部的计划系统。
 
 面向 AI Agent 的训记（Xunji）Open API 技能仓库，用于**读取训练记录**、**分析历史训练**、以及**写入/更新训练记录**。
@@ -13,28 +13,23 @@
 
 ## 可用技能
 
-### `xunji-reader`
+### `xunji`
 
-读取训记训练数据。
+统一的训记训练数据读写 skill。
 
-- 调用 `POST /api_trains_for_llm`
+- 读取时调用 `POST /api_trains_for_llm`
+- 写入时调用 `POST /api_upsert_trains_for_llm`
 - 按日期读取训练记录
 - 本地缓存训练历史，减少重复请求
 - 维护动作库 `action-library.json`，供后续写入流程复用
-
-适合用于：训练复盘、历史分析、动作名称对齐、生成训练摘要。
-
-### `xunji-writer`
-
-写回训记训练数据。
-
-- 调用 `POST /api_upsert_trains_for_llm`
-- 支持更新已有记录
+- 调用时只按 `YYYY-MM-DD` 请求目标训练日，并通过 `Authorization: Bearer $XUNJI_API_KEY` 鉴权
+- 按训练 ID upsert，支持更新已有记录
 - 支持新建训练记录和休息日
 - 写入前做结构校验、动作名对齐与规范化
 - 支持 `--dry-run` 先验证再写入
+- 写入成功后以服务端返回的 `res` 作为最终结果并同步本地缓存
 
-适合用于：把 Agent 生成的结构化训练内容安全写回训记。
+适合用于：训练复盘、历史分析、动作名称对齐、生成训练摘要，以及把 Agent 生成的结构化训练内容安全写回训记。
 
 ## 项目定位
 
@@ -42,18 +37,17 @@
 - **支持读取与写入**：既能读训练历史，也能把规范化结果写回 App
 - **写入更安全**：有动作库对齐、结构校验、`--dry-run` 等保护机制
 - **内置本地缓存**：适合反复分析同一批训练数据
-- **功能边界清晰**：仓库只聚焦两个技能，不试图做完整 SDK
+- **功能边界清晰**：仓库只聚焦一个训记 skill，不试图做完整 SDK
 
 ## 仓库结构
 
 ```text
 xunji/
-├── xunji-reader/
-│   ├── SKILL.md
-│   └── scripts/fetch_xunji_trains.py
-└── xunji-writer/
+└── xunji/
     ├── SKILL.md
-    └── scripts/upsert_xunji_trains.py
+    └── scripts/
+        ├── fetch_xunji_trains.py
+        └── upsert_xunji_trains.py
 ```
 
 ## 快速开始
@@ -64,7 +58,7 @@ xunji/
 export XUNJI_API_KEY="your-api-key"
 ```
 
-配置好 `XUNJI_API_KEY` 之后，就可以把这两个 skill 接入 Agent 工作流。
+配置好 `XUNJI_API_KEY` 之后，就可以把 `xunji` skill 接入 Agent 工作流。
 
 ### 2. 推荐方式：以 Agent 工作流为主
 
@@ -87,25 +81,25 @@ export XUNJI_API_KEY="your-api-key"
 #### 读取训练数据
 
 ```bash
-python3 xunji-reader/scripts/fetch_xunji_trains.py --date 2026-04-02
+python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02
 ```
 
 只输出训练行：
 
 ```bash
-python3 xunji-reader/scripts/fetch_xunji_trains.py --date 2026-04-02 --format lines
+python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02 --format lines
 ```
 
 强制刷新缓存：
 
 ```bash
-python3 xunji-reader/scripts/fetch_xunji_trains.py --date 2026-04-02 --refresh
+python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02 --refresh
 ```
 
 #### 写入前先校验
 
 ```bash
-python3 xunji-writer/scripts/upsert_xunji_trains.py \
+python3 xunji/scripts/upsert_xunji_trains.py \
   --date 2026-04-02 \
   --res-file /tmp/xunji-res.json \
   --dry-run
@@ -114,7 +108,7 @@ python3 xunji-writer/scripts/upsert_xunji_trains.py \
 #### 写入新的训练记录
 
 ```bash
-python3 xunji-writer/scripts/upsert_xunji_trains.py \
+python3 xunji/scripts/upsert_xunji_trains.py \
   --date 2026-04-02 \
   --allow-new-records \
   --line '2026-04-02,胸部训练,状态不错,1.卧推,1组,60kg,10次,2组,60kg,8次'
@@ -145,7 +139,7 @@ python3 xunji-writer/scripts/upsert_xunji_trains.py \
 ## 局限性
 
 - **不能直接创建训记 App 内部计划对象**
-- 新建记录后，read-after-write 不能总是作为可靠确认方式
+- 写回接口是按训练 ID upsert，不会因为某条旧训练没有出现在本次 `res` 里就自动删除它
 - 写入流程依赖动作库对齐，动作名不明确时需要人工确认
 - 类似 `10x3` 这种歧义表达不会被自动猜测
 

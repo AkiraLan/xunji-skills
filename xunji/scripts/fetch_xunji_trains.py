@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 
 
 DATE_FORMAT = "%Y-%m-%d"
-SHORT_DATE_FORMAT = "%y%m%d"
 BASE_URL = "https://trains.xunjiapp.cn"
 API_PATH = "/api_trains_for_llm"
 ACTION_START_RE = re.compile(r"^\d+\.(?!\d+(?:\.\d+)?(?:km|kg)$)(.+)$")
@@ -37,10 +36,6 @@ def validate_date(date_str: str) -> str:
     except ValueError as exc:
         raise RuntimeError(f"Invalid date '{date_str}'. Expected YYYY-MM-DD") from exc
     return date_str
-
-
-def to_short_date_token(date_str: str) -> str:
-    return datetime.strptime(date_str, DATE_FORMAT).strftime(SHORT_DATE_FORMAT)
 
 
 def default_cache_dir() -> Path:
@@ -265,16 +260,13 @@ def build_ssl_context() -> ssl.SSLContext:
 
 def fetch_once(query_date: str, api_key: str) -> list[str]:
     url = f"{BASE_URL}{API_PATH}"
-    request_body = json.dumps({"datestr": query_date, "apikey": api_key}).encode(
-        "utf-8"
-    )
+    request_body = json.dumps({"datestr": query_date}).encode("utf-8")
     request = Request(
         url,
         data=request_body,
         method="POST",
         headers={
             "Authorization": f"Bearer {api_key}",
-            "x-api-key": api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
@@ -318,36 +310,16 @@ def fetch_once(query_date: str, api_key: str) -> list[str]:
 
 
 def fetch_remote(date_str: str, api_key: str) -> dict:
-    short_date = to_short_date_token(date_str)
-    primary_res = fetch_once(date_str, api_key)
-    fallback_error = None
-    if primary_res:
-        matched_query = date_str
-        res = primary_res
-    elif short_date != date_str:
-        try:
-            fallback_res = fetch_once(short_date, api_key)
-            matched_query = short_date
-            res = fallback_res
-        except Exception as exc:
-            # Keep the primary (valid but empty) result when fallback is throttled or fails.
-            matched_query = date_str
-            res = primary_res
-            fallback_error = str(exc)
-    else:
-        matched_query = date_str
-        res = primary_res
+    res = fetch_once(date_str, api_key)
 
     payload = {
         "datestr": date_str,
-        "queried_datestr": matched_query,
+        "queried_datestr": date_str,
         "cached": False,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "count": len(res),
         "res": res,
     }
-    if fallback_error:
-        payload["fallback_error"] = fallback_error
     return payload
 
 
