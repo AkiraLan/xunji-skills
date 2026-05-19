@@ -17,17 +17,17 @@
 
 统一的训记训练数据读写 skill。
 
-- 读取时调用 `POST /api_trains_for_llm`
-- 写入时调用 `POST /api_upsert_trains_for_llm`
-- 按日期读取训练记录
+- 读取时调用 `POST /api_trains_for_llm_v2`（Open API v2，body 携带 `schema_version: "train_open_api_v2"`）
+- 写入时调用 `POST /api_upsert_trains_for_llm_v2`，附带 `client_request_id` 与可选 `dry_run`
+- 按日期读取训练记录，默认轻量；加 `--full` 可启用 `include_full_data:true` 拉取未打勾组、每组 RPE 和备注
 - 本地缓存训练历史，减少重复请求
 - 维护动作库 `action-library.json`，供后续写入流程复用
-- 调用时只按 `YYYY-MM-DD` 请求目标训练日，并通过 `Authorization: Bearer $XUNJI_API_KEY` 鉴权
-- 按训练 ID upsert，支持更新已有记录
-- 支持新建训练记录和休息日
-- 写入前做结构校验、动作名对齐与规范化
-- 支持 `--dry-run` 先验证再写入
-- 写入成功后以服务端返回的 `res` 作为最终结果并同步本地缓存
+- 调用时只按 `YYYY-MM-DD` 请求目标训练日（已下线 `YYMMDD` 兼容），并通过 `Authorization: Bearer $XUNJI_API_KEY` 鉴权
+- 按 `localid` upsert，支持更新已有记录；单次最多 4 条训练、每条 15 个动作、每个动作 20 组
+- 支持新建训练记录、休息日，以及自重 / 有氧 / 计时 / Tabata 的 `sets[].metrics`
+- 写入前做结构校验、动作名对齐与规范化（中文 `name`，不发 `key`）
+- 支持本地 `--dry-run` 校验、`--server-dry-run` 透传服务端 `dry_run`
+- 写入成功后以服务端返回的 `res.trains` 作为最终结果并同步本地缓存
 
 适合用于：训练复盘、历史分析、动作名称对齐、生成训练摘要，以及把 Agent 生成的结构化训练内容安全写回训记。
 
@@ -90,6 +90,12 @@ python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02
 python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02 --format lines
 ```
 
+需要未打勾组、每组 RPE 和备注时：
+
+```bash
+python3 xunji/scripts/fetch_xunji_trains.py --date 2026-04-02 --full
+```
+
 强制刷新缓存：
 
 ```bash
@@ -139,9 +145,11 @@ python3 xunji/scripts/upsert_xunji_trains.py \
 ## 局限性
 
 - **不能直接创建训记 App 内部计划对象**
-- 写回接口是按训练 ID upsert，不会因为某条旧训练没有出现在本次 `res` 里就自动删除它
-- 写入流程依赖动作库对齐，动作名不明确时需要人工确认
+- 写回接口是按 `localid` upsert，不会因为某条旧训练没有出现在本次 `res` 里就自动删除它
+- 写入流程依赖动作库对齐，动作名不明确时需要人工确认；未命中本地库时请回查 `https://github.com/Foveluy/Xunji-movements` 官方中文名
 - 类似 `10x3` 这种歧义表达不会被自动猜测
+- 单次最多 4 条训练、每训练 15 动作、每动作 20 组；超出会被服务端拒
+- 2026-05-19 实测服务端 `dry_run: true` 仍会写库，请优先使用本地 `--dry-run`
 
 
 ## 安全说明

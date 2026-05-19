@@ -9,6 +9,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -16,9 +17,12 @@ from urllib.request import Request, urlopen
 
 
 DATE_FORMAT = "%Y-%m-%d"
-SHORT_DATE_FORMAT = "%y%m%d"
 BASE_URL = "https://trains.xunjiapp.cn"
-API_PATH = "/api_upsert_trains_for_llm"
+API_PATH = "/api_upsert_trains_for_llm_v2"
+SCHEMA_VERSION = "train_open_api_v2"
+MAX_TRAINS_PER_CALL = 4
+MAX_MOVEMENTS_PER_TRAIN = 15
+MAX_SETS_PER_MOVEMENT = 20
 ACTION_START_RE = re.compile(r"^\d+\.(?!\d).+")
 SET_TOKEN_RE = re.compile(r"^\d+组$")
 COMPRESSED_SET_TOKEN_RE = re.compile(r"^[xX](\d+)$")
@@ -30,9 +34,17 @@ VALID_WEIGHT_RE = re.compile(
 WEIGHT_PREFIX_RE = re.compile(
     r"^(\d+(?:\.\d+)?(?:kg|g|lb|lbs|公斤|千克|磅))(.+)$", re.IGNORECASE
 )
+WEIGHT_VALUE_UNIT_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)(kg|g|lb|lbs|公斤|千克|磅)$", re.IGNORECASE
+)
 REPS_TOKEN_RE = re.compile(r"^\d+次$")
 TIME_TOKEN_RE = re.compile(r"^time:\d+(?:s|m|h)$", re.IGNORECASE)
+TIME_VALUE_UNIT_RE = re.compile(r"^time:(\d+)([smh])$", re.IGNORECASE)
 CARDIO_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?(?:km|m|kcal|bpm)$", re.IGNORECASE)
+CARDIO_VALUE_UNIT_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)(km|m|kcal|bpm)$", re.IGNORECASE
+)
+SELFWEIGHT_TOKEN_RE = re.compile(r"^自重$")
 RANGE_TOKEN_RE = re.compile(
     r"^\d+(?:\.\d+)?-\d+(?:\.\d+)?(?:次|kg|g|lb|lbs|公斤|千克|磅)$",
     re.IGNORECASE,
@@ -62,12 +74,12 @@ def validate_target_date(date_str: str) -> str:
 
 def normalize_line_date(token: str) -> str:
     token = token.strip()
-    for fmt in (DATE_FORMAT, SHORT_DATE_FORMAT):
-        try:
-            return datetime.strptime(token, fmt).strftime(DATE_FORMAT)
-        except ValueError:
-            continue
-    raise RuntimeError(f"datestr invalid in line: {token}")
+    try:
+        return datetime.strptime(token, DATE_FORMAT).strftime(DATE_FORMAT)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"datestr invalid in line: {token}. Expected YYYY-MM-DD; compact YYMMDD is not accepted."
+        ) from exc
 
 
 def default_cache_dir() -> Path:
@@ -259,8 +271,10 @@ def load_res(args: argparse.Namespace) -> list[str]:
 def validate_res_lines(target_date: str, res_lines: list[str]) -> list[str]:
     if not isinstance(res_lines, list) or not res_lines:
         raise RuntimeError("res must be a non-empty array")
-    if len(res_lines) > 12:
-        raise RuntimeError("res may contain at most 12 training lines")
+    if len(res_lines) > MAX_TRAINS_PER_CALL:
+        raise RuntimeError(
+            f"res may contain at most {MAX_TRAINS_PER_CALL} training lines per v2 call"
+        )
 
     validated: list[str] = []
     for index, line in enumerate(res_lines, start=1):
@@ -382,6 +396,7 @@ def is_exact_structured_token(token: str) -> bool:
         or REPS_TOKEN_RE.fullmatch(normalized)
         or TIME_TOKEN_RE.fullmatch(normalized)
         or CARDIO_TOKEN_RE.fullmatch(normalized)
+        or SELFWEIGHT_TOKEN_RE.fullmatch(normalized)
     )
 
 
@@ -726,6 +741,7 @@ def is_valid_strength_set_value(token: str) -> bool:
         VALID_WEIGHT_RE.fullmatch(normalized)
         or REPS_TOKEN_RE.fullmatch(normalized)
         or TIME_TOKEN_RE.fullmatch(normalized)
+        or SELFWEIGHT_TOKEN_RE.fullmatch(normalized)
     )
 
 
@@ -768,9 +784,283 @@ def build_cache_payload(
     }
 
 
-def fetch_remote(res_lines: list[str], api_key: str) -> dict:
+def parse_set_payload_token(token: str) -> dict | None:
+    normalized = token.strip()
+    m = WEIGHT_VALUE_UNIT_RE.fullmatch(normalized)
+    if m:
+        value_str, unit = m.group(1), m.group(2).lower()
+        return {"weight": value_str, "unit": unit}
+    m = REPS_TOKEN_RE.fullmatch(normalized)
+    if m:
+        return {"reps": normalized[:-1]}
+    m = TIME_VALUE_UNIT_RE.fullmatch(normalized)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        secs = n if unit == "s" else n * 60 if unit == "m" else n * 3600
+        return {"duration_s": secs}
+    if SELFWEIGHT_TOKEN_RE.fullmatch(normalized):
+        return {"selfWeight": True}
+    m = CARDIO_VALUE_UNIT_RE.fullmatch(normalized)
+    if m:
+        raw = m.group(1)
+        unit = m.group(2).lower()
+        val: float | int = float(raw) if "." in raw else int(raw)
+        if unit == "km":
+            distance_m = val * 1000 if isinstance(val, float) else val * 1000
+            if isinstance(distance_m, float):
+                distance_m = int(distance_m) if distance_m.is_integer() else distance_m
+            return {"metrics": {"distance": distance_m, "distance_unit": "m"}}
+        if unit == "m":
+            return {"metrics": {"distance": val, "distance_unit": "m"}}
+        if unit == "kcal":
+            return {"metrics": {"kcal": val}}
+        if unit == "bpm":
+            return {"metrics": {"bpm": val}}
+    return None
+
+
+def action_to_movement(action: list[str]) -> dict:
+    if not action:
+        return {"name": "", "sets": []}
+    header = action[0].strip()
+    name = header.split(".", 1)[1] if "." in header else header
+    sets: list[dict] = []
+    current: dict | None = None
+    for raw_token in action[1:]:
+        tok = raw_token.strip()
+        if not tok:
+            continue
+        if SET_TOKEN_RE.fullmatch(tok):
+            if current is not None:
+                sets.append(current)
+            current = {"done": True}
+            continue
+        partial = parse_set_payload_token(tok)
+        if partial is None:
+            continue
+        if current is None:
+            current = {"done": True}
+        if "metrics" in partial:
+            merged = dict(current.get("metrics") or {})
+            merged.update(partial["metrics"])
+            current["metrics"] = merged
+        else:
+            current.update(partial)
+    if current is not None:
+        sets.append(current)
+    return {"name": name, "sets": sets}
+
+
+def parsed_line_to_v2_train(parsed: dict) -> dict:
+    if parsed.get("rest_day"):
+        return {"datestr": parsed["date"], "rest_day": True}
+    train: dict = {
+        "datestr": parsed["date"],
+        "title": parsed.get("title", ""),
+    }
+    train_id = parsed.get("id")
+    if train_id and train_id.startswith("id:"):
+        raw = train_id[3:]
+        try:
+            train["localid"] = int(raw)
+        except ValueError:
+            train["localid"] = raw
+    train_time = parsed.get("train_time")
+    if train_time and train_time.startswith("train_time:"):
+        tt = train_time[len("train_time:") :]
+        if "-" in tt:
+            start_str, end_str = tt.split("-", 1)
+            try:
+                train["start"] = int(start_str)
+                train["end"] = int(end_str)
+            except ValueError:
+                pass
+    notes = parsed.get("notes") or []
+    if notes:
+        train["remarks"] = ",".join(notes)
+    movements = [
+        action_to_movement(action) for action in parsed.get("actions", [])
+    ]
+    train["movements"] = movements
+    return train
+
+
+def res_lines_to_v2_trains(res_lines: list[str]) -> list[dict]:
+    trains: list[dict] = []
+    for line in res_lines:
+        parsed = parse_training_line(line)
+        trains.append(parsed_line_to_v2_train(parsed))
+    return trains
+
+
+def enforce_v2_payload_limits(trains: list[dict]) -> None:
+    if len(trains) > MAX_TRAINS_PER_CALL:
+        raise RuntimeError(
+            f"v2 API accepts at most {MAX_TRAINS_PER_CALL} trains per call (got {len(trains)})"
+        )
+    for train in trains:
+        if train.get("rest_day"):
+            continue
+        movements = train.get("movements") or []
+        if len(movements) > MAX_MOVEMENTS_PER_TRAIN:
+            raise RuntimeError(
+                f"Train '{train.get('title')}' has {len(movements)} movements; v2 API max is {MAX_MOVEMENTS_PER_TRAIN}"
+            )
+        for movement in movements:
+            sets = movement.get("sets") or []
+            if len(sets) > MAX_SETS_PER_MOVEMENT:
+                raise RuntimeError(
+                    f"Movement '{movement.get('name')}' has {len(sets)} sets; v2 API max is {MAX_SETS_PER_MOVEMENT}"
+                )
+
+
+def format_numeric(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
+    return str(value)
+
+
+def _nonempty_numeric(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def v2_set_to_tokens(set_obj: dict) -> list[str]:
+    tokens: list[str] = []
+    raw_weight = set_obj.get("weight")
+    raw_weight_kg = set_obj.get("weight_kg")
+    weight_value = _nonempty_numeric(raw_weight)
+    if weight_value is None:
+        weight_value = _nonempty_numeric(raw_weight_kg)
+    if weight_value is not None and weight_value > 0:
+        unit = (set_obj.get("unit") or "").strip() or (
+            "kg" if raw_weight_kg is not None else "kg"
+        )
+        tokens.append(f"{format_numeric(weight_value)}{unit}")
+    reps_value = _nonempty_numeric(set_obj.get("reps"))
+    if reps_value is not None and reps_value > 0:
+        tokens.append(f"{format_numeric(reps_value)}次")
+    duration_value = _nonempty_numeric(set_obj.get("duration_s"))
+    if duration_value is None:
+        duration_value = _nonempty_numeric(set_obj.get("time"))
+    if duration_value is not None and duration_value > 0:
+        tokens.append(f"time:{format_numeric(duration_value)}s")
+    if set_obj.get("selfWeight"):
+        tokens.append("自重")
+    metrics = set_obj.get("metrics") or {}
+    distance = metrics.get("distance")
+    if distance is not None:
+        unit = metrics.get("distance_unit", "m")
+        try:
+            d_val = float(distance)
+            if unit == "m" and d_val >= 1000 and d_val % 1000 == 0:
+                tokens.append(f"{int(d_val / 1000)}km")
+            elif unit == "m":
+                tokens.append(f"{format_numeric(d_val)}m")
+            elif unit == "km":
+                tokens.append(f"{format_numeric(d_val)}km")
+            else:
+                tokens.append(f"{format_numeric(d_val)}{unit}")
+        except (TypeError, ValueError):
+            tokens.append(str(distance))
+    kcal = metrics.get("kcal")
+    if kcal is not None:
+        tokens.append(f"{format_numeric(kcal)}kcal")
+    bpm = metrics.get("bpm")
+    if bpm is not None:
+        tokens.append(f"{format_numeric(bpm)}bpm")
+    steps = metrics.get("steps")
+    if steps is not None:
+        tokens.append(f"{format_numeric(steps)}steps")
+    return tokens
+
+
+def v2_train_to_csv_line(train: dict) -> str:
+    datestr = str(train.get("datestr") or "")
+    if train.get("rest_day"):
+        return f"{datestr},休息日"
+    movements = train.get("movements") or []
+    if not movements and (train.get("title") in {None, "", "休息日"}):
+        return f"{datestr},休息日"
+    segments: list[str] = [datestr]
+    localid = train.get("localid")
+    if localid is not None:
+        segments.append(f"id:{localid}")
+    segments.append(str(train.get("title") or ""))
+    start = train.get("start")
+    end = train.get("end")
+    if (
+        start is not None
+        and end is not None
+        and not (isinstance(start, int) and start <= 0)
+        and not (isinstance(end, int) and end <= 0)
+    ):
+        segments.append(f"train_time:{start}-{end}")
+    remarks = train.get("remarks")
+    if remarks:
+        for note in str(remarks).split(","):
+            stripped = note.strip()
+            if stripped:
+                segments.append(stripped)
+    for idx, movement in enumerate(movements, start=1):
+        name = str(movement.get("name") or "")
+        segments.append(f"{idx}.{name}")
+        sets = movement.get("sets") or []
+        if not sets:
+            continue
+        if len(sets) == 1:
+            payload_tokens = v2_set_to_tokens(sets[0])
+            segments.extend(payload_tokens)
+            continue
+        for set_idx, set_obj in enumerate(sets, start=1):
+            segments.append(f"{set_idx}组")
+            segments.extend(v2_set_to_tokens(set_obj))
+    return ",".join(seg for seg in segments if seg is not None and seg != "")
+
+
+def trains_response_to_lines(payload_res: object) -> list[str]:
+    trains: list[dict] = []
+    if isinstance(payload_res, dict):
+        candidate = payload_res.get("trains")
+        if isinstance(candidate, list):
+            trains = [t for t in candidate if isinstance(t, dict)]
+    elif isinstance(payload_res, list):
+        for item in payload_res:
+            if isinstance(item, dict):
+                trains.append(item)
+    return [v2_train_to_csv_line(train) for train in trains]
+
+
+def fetch_remote(
+    trains: list[dict],
+    api_key: str,
+    *,
+    client_request_id: str,
+    include_full_data: bool = False,
+    server_dry_run: bool = False,
+) -> dict:
     url = f"{BASE_URL}{API_PATH}"
-    request_body = json.dumps({"res": res_lines}).encode("utf-8")
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "client_request_id": client_request_id,
+        "dry_run": bool(server_dry_run),
+        "include_full_data": bool(include_full_data),
+        "res": trains,
+    }
+    request_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = Request(
         url,
         data=request_body,
@@ -790,8 +1080,8 @@ def fetch_remote(res_lines: list[str], api_key: str) -> dict:
             decoded_text = decoded.decode("utf-8")
             payload = json.loads(decoded_text)
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body_text}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
@@ -803,23 +1093,31 @@ def fetch_remote(res_lines: list[str], api_key: str) -> dict:
     if payload.get("success") is False:
         raise RuntimeError(f"API returned success=false: {decoded_text}")
 
-    res = payload.get("res")
-    if not isinstance(res, list):
-        raise RuntimeError(
-            f"API response did not contain a list in 'res': {decoded_text}"
-        )
+    res_payload = payload.get("res")
+    response_lines = trains_response_to_lines(res_payload)
+    response_trains: list[dict]
+    if isinstance(res_payload, dict) and isinstance(res_payload.get("trains"), list):
+        response_trains = [
+            t for t in res_payload["trains"] if isinstance(t, dict)
+        ]
+    elif isinstance(res_payload, list):
+        response_trains = [t for t in res_payload if isinstance(t, dict)]
+    else:
+        response_trains = []
 
     count = payload.get("count")
-    if not res:
+    if not response_lines:
         acknowledged_count = (
-            count if isinstance(count, int) and count > 0 else len(res_lines)
+            count if isinstance(count, int) and count > 0 else len(trains)
         )
         return {
             "count": acknowledged_count,
-            "res": list(res_lines),
+            "res": [],
+            "response_trains": [],
             "response_res_empty": True,
             "raw_response": decoded_text,
             "acknowledged_with_empty_res": True,
+            "server_count": count if isinstance(count, int) else None,
         }
 
     if isinstance(count, int) and count <= 0:
@@ -828,9 +1126,10 @@ def fetch_remote(res_lines: list[str], api_key: str) -> dict:
         )
 
     return {
-        "count": count if isinstance(count, int) else len(res),
-        "res": res,
-        "response_res_empty": payload.get("response_res_empty"),
+        "count": count if isinstance(count, int) else len(response_lines),
+        "res": response_lines,
+        "response_trains": response_trains,
+        "response_res_empty": False,
         "raw_response": decoded_text,
         "acknowledged_with_empty_res": False,
         "server_count": count if isinstance(count, int) else None,
@@ -871,6 +1170,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--preserve-invalid-in-remarks",
         action="store_true",
         help="Keep discarded invalid tokens in remarks instead of dropping them after warning.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Send include_full_data:true so the API echoes back unchecked sets, per-set RPE, and remarks.",
+    )
+    parser.add_argument(
+        "--server-dry-run",
+        action="store_true",
+        help=(
+            "Set dry_run:true in the v2 API body so the server is supposed to validate without writing. "
+            "WARNING: live tests on 2026-05-19 showed the Xunji server still persists these calls, "
+            "so prefer the local --dry-run flag for non-destructive validation."
+        ),
+    )
+    parser.add_argument(
+        "--client-request-id",
+        help="Override the auto-generated client_request_id used for idempotency.",
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -922,6 +1239,10 @@ def main() -> int:
         )
         validate_strength_set_values(res_lines)
 
+        v2_trains = res_lines_to_v2_trains(res_lines)
+        enforce_v2_payload_limits(v2_trains)
+        client_request_id = args.client_request_id or f"xunji-skill-{uuid.uuid4()}"
+
         if args.dry_run:
             emit(
                 {
@@ -930,6 +1251,10 @@ def main() -> int:
                     "fetched_at": datetime.now(timezone.utc).isoformat(),
                     "count": len(res_lines),
                     "res": res_lines,
+                    "trains": v2_trains,
+                    "client_request_id": client_request_id,
+                    "include_full_data": bool(args.full),
+                    "server_dry_run": bool(args.server_dry_run),
                     "dry_run": True,
                     "cache_path": str(cache_path),
                     "normalization_warnings": normalization_warnings,
@@ -939,21 +1264,36 @@ def main() -> int:
             return 0
 
         api_key = resolve_api_key()
-        remote_payload = fetch_remote(res_lines, api_key)
-        final_res = validate_res_lines(target_date, remote_payload["res"])
-        server_count = remote_payload.get("server_count")
-        if isinstance(server_count, int) and server_count != len(final_res):
-            raise RuntimeError(
-                "API response count does not match the number of returned res lines: "
-                f"count={server_count} len(res)={len(final_res)}; "
-                f"raw_response={remote_payload['raw_response']}"
-            )
+        remote_payload = fetch_remote(
+            v2_trains,
+            api_key,
+            client_request_id=client_request_id,
+            include_full_data=bool(args.full),
+            server_dry_run=bool(args.server_dry_run),
+        )
+        if remote_payload.get("acknowledged_with_empty_res"):
+            final_res = list(res_lines)
+            final_trains = list(v2_trains)
+        else:
+            final_res = validate_res_lines(target_date, remote_payload["res"])
+            final_trains = remote_payload.get("response_trains") or []
+            server_count = remote_payload.get("server_count")
+            if isinstance(server_count, int) and server_count != len(final_res):
+                raise RuntimeError(
+                    "API response count does not match the number of returned res lines: "
+                    f"count={server_count} len(res)={len(final_res)}; "
+                    f"raw_response={remote_payload['raw_response']}"
+                )
         payload = build_cache_payload(
             target_date,
             final_res,
             count=remote_payload["count"],
+            trains=final_trains,
             response_res_empty=remote_payload.get("response_res_empty"),
             normalization_warnings=normalization_warnings,
+            client_request_id=client_request_id,
+            include_full_data=bool(args.full),
+            server_dry_run=bool(args.server_dry_run),
         )
         atomic_write_json(cache_path, payload)
         emit(payload, args.format)

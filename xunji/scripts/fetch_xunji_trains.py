@@ -17,10 +17,142 @@ from urllib.request import Request, urlopen
 
 DATE_FORMAT = "%Y-%m-%d"
 BASE_URL = "https://trains.xunjiapp.cn"
-API_PATH = "/api_trains_for_llm"
+API_PATH = "/api_trains_for_llm_v2"
+SCHEMA_VERSION = "train_open_api_v2"
 ACTION_START_RE = re.compile(r"^\d+\.(?!\d+(?:\.\d+)?(?:km|kg)$)(.+)$")
 ACTION_LIBRARY_HISTORY_DAYS = 92
 ACTION_LIBRARY_RETRY_DELAY_SECONDS = 95
+
+
+def format_numeric(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
+    return str(value)
+
+
+def _nonempty_numeric(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def v2_set_to_tokens(set_obj: dict) -> list[str]:
+    tokens: list[str] = []
+    raw_weight = set_obj.get("weight")
+    raw_weight_kg = set_obj.get("weight_kg")
+    weight_value = _nonempty_numeric(raw_weight)
+    if weight_value is None:
+        weight_value = _nonempty_numeric(raw_weight_kg)
+    if weight_value is not None and weight_value > 0:
+        unit = (set_obj.get("unit") or "").strip() or (
+            "kg" if raw_weight_kg is not None else "kg"
+        )
+        tokens.append(f"{format_numeric(weight_value)}{unit}")
+    reps_value = _nonempty_numeric(set_obj.get("reps"))
+    if reps_value is not None and reps_value > 0:
+        tokens.append(f"{format_numeric(reps_value)}次")
+    duration_value = _nonempty_numeric(set_obj.get("duration_s"))
+    if duration_value is None:
+        duration_value = _nonempty_numeric(set_obj.get("time"))
+    if duration_value is not None and duration_value > 0:
+        tokens.append(f"time:{format_numeric(duration_value)}s")
+    if set_obj.get("selfWeight"):
+        tokens.append("自重")
+    metrics = set_obj.get("metrics") or {}
+    distance = metrics.get("distance")
+    if distance is not None:
+        unit = metrics.get("distance_unit", "m")
+        try:
+            d_val = float(distance)
+            if unit == "m" and d_val >= 1000 and d_val % 1000 == 0:
+                tokens.append(f"{int(d_val / 1000)}km")
+            elif unit == "m":
+                tokens.append(f"{format_numeric(d_val)}m")
+            elif unit == "km":
+                tokens.append(f"{format_numeric(d_val)}km")
+            else:
+                tokens.append(f"{format_numeric(d_val)}{unit}")
+        except (TypeError, ValueError):
+            tokens.append(str(distance))
+    kcal = metrics.get("kcal")
+    if kcal is not None:
+        tokens.append(f"{format_numeric(kcal)}kcal")
+    bpm = metrics.get("bpm")
+    if bpm is not None:
+        tokens.append(f"{format_numeric(bpm)}bpm")
+    steps = metrics.get("steps")
+    if steps is not None:
+        tokens.append(f"{format_numeric(steps)}steps")
+    return tokens
+
+
+def v2_train_to_csv_line(train: dict) -> str:
+    datestr = str(train.get("datestr") or "")
+    if train.get("rest_day"):
+        return f"{datestr},休息日"
+    movements = train.get("movements") or []
+    if not movements and (train.get("title") in {None, "", "休息日"}):
+        return f"{datestr},休息日"
+    segments: list[str] = [datestr]
+    localid = train.get("localid")
+    if localid is not None:
+        segments.append(f"id:{localid}")
+    segments.append(str(train.get("title") or ""))
+    start = train.get("start")
+    end = train.get("end")
+    if (
+        start is not None
+        and end is not None
+        and not (isinstance(start, int) and start <= 0)
+        and not (isinstance(end, int) and end <= 0)
+    ):
+        segments.append(f"train_time:{start}-{end}")
+    remarks = train.get("remarks")
+    if remarks:
+        for note in str(remarks).split(","):
+            stripped = note.strip()
+            if stripped:
+                segments.append(stripped)
+    for idx, movement in enumerate(movements, start=1):
+        name = str(movement.get("name") or "")
+        segments.append(f"{idx}.{name}")
+        sets = movement.get("sets") or []
+        if not sets:
+            continue
+        if len(sets) == 1:
+            segments.extend(v2_set_to_tokens(sets[0]))
+            continue
+        for set_idx, set_obj in enumerate(sets, start=1):
+            segments.append(f"{set_idx}组")
+            segments.extend(v2_set_to_tokens(set_obj))
+    return ",".join(seg for seg in segments if seg is not None and seg != "")
+
+
+def extract_trains_from_payload(payload_res: object) -> list[dict]:
+    trains: list[dict] = []
+    if isinstance(payload_res, dict):
+        candidate = payload_res.get("trains")
+        if isinstance(candidate, list):
+            for item in candidate:
+                if isinstance(item, dict):
+                    trains.append(item)
+    elif isinstance(payload_res, list):
+        for item in payload_res:
+            if isinstance(item, dict):
+                trains.append(item)
+    return trains
 
 
 def resolve_api_key() -> str:
@@ -258,9 +390,16 @@ def build_ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def fetch_once(query_date: str, api_key: str) -> list[str]:
+def fetch_once(
+    query_date: str, api_key: str, *, include_full_data: bool = False
+) -> list[dict]:
     url = f"{BASE_URL}{API_PATH}"
-    request_body = json.dumps({"datestr": query_date}).encode("utf-8")
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "datestr": query_date,
+        "include_full_data": bool(include_full_data),
+    }
+    request_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = Request(
         url,
         data=request_body,
@@ -280,15 +419,12 @@ def fetch_once(query_date: str, api_key: str) -> list[str]:
             decoded_text = decoded.decode("utf-8")
             payload = json.loads(decoded_text)
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body_text}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError("Failed to decode API response as JSON") from exc
-
-    if isinstance(payload, list):
-        return payload
 
     if not isinstance(payload, dict):
         raise RuntimeError(
@@ -301,24 +437,25 @@ def fetch_once(query_date: str, api_key: str) -> list[str]:
         )
 
     res = payload.get("res")
-    if not isinstance(res, list):
-        raise RuntimeError(
-            f"API response did not contain a list in 'res' for datestr={query_date}: {decoded_text}"
-        )
-
-    return res
+    trains = extract_trains_from_payload(res)
+    return trains
 
 
-def fetch_remote(date_str: str, api_key: str) -> dict:
-    res = fetch_once(date_str, api_key)
+def fetch_remote(
+    date_str: str, api_key: str, *, include_full_data: bool = False
+) -> dict:
+    trains = fetch_once(date_str, api_key, include_full_data=include_full_data)
+    lines = [v2_train_to_csv_line(train) for train in trains]
 
     payload = {
         "datestr": date_str,
         "queried_datestr": date_str,
         "cached": False,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(res),
-        "res": res,
+        "include_full_data": bool(include_full_data),
+        "count": len(trains),
+        "res": lines,
+        "trains": trains,
     }
     return payload
 
@@ -333,11 +470,16 @@ def emit(payload: dict, output_format: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch Xunji training data with local caching"
+        description="Fetch Xunji training data via v2 Open API with local caching"
     )
     parser.add_argument("--date", required=True, help="Training date in YYYY-MM-DD")
     parser.add_argument(
         "--refresh", action="store_true", help="Ignore cache and fetch from API again"
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Send include_full_data:true to return unchecked sets, per-set RPE, and remarks.",
     )
     parser.add_argument(
         "--format", choices=["json", "lines"], default="json", help="Output format"
@@ -370,7 +512,9 @@ def main() -> int:
                 return 0
 
         api_key = resolve_api_key()
-        target_payload = fetch_remote(date_str, api_key)
+        target_payload = fetch_remote(
+            date_str, api_key, include_full_data=bool(args.full)
+        )
         ensure_action_library_history_cache(
             date_str, cache_dir, api_key, target_payload=target_payload
         )
